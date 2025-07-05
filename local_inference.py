@@ -1,6 +1,6 @@
 """
-YOLO Duct Segmentation - Sistema de Identificação de Sessões de Dutos
-Versão corrigida e otimizada para detecção de sessões em dutos quadrados de 50cm
+YOLO Duct Segmentation - Real-time Local Inference
+Run this script locally on your PC to test the trained model with video files
 """
 
 import cv2
@@ -12,72 +12,50 @@ import os
 from pathlib import Path
 from collections import defaultdict, deque
 import json
-import math
 
 class DuctDetectorLocal:
     def __init__(self, model_path, confidence_threshold=0.5):
         """
-        Inicializa o detector de sessões de dutos
-        
-        Args:
-            model_path: Caminho para o modelo YOLO treinado
-            confidence_threshold: Limiar de confiança para detecções
+        Initialize the duct detector for local inference with tracking
         """
         self.model_path = model_path
         self.confidence_threshold = confidence_threshold
         
-        # Carrega o modelo YOLO
-        print(f"🔄 Carregando modelo de: {model_path}")
-        try:
-            self.model = YOLO(model_path)
-            print("✅ Modelo carregado com sucesso!")
-        except Exception as e:
-            print(f"❌ Erro ao carregar modelo: {e}")
-            raise
+        # Load the trained model
+        print(f"🔄 Loading model from: {model_path}")
+        self.model = YOLO(model_path)
+        print("✅ Model loaded successfully!")
         
-        # Configurações da câmera (valores padrão - ajustar conforme necessário)
-        self.camera_matrix = None
-        self.frame_width = None
-        self.frame_height = None
-        
-        # Histórico de rastreamento
-        self.track_history = defaultdict(lambda: deque(maxlen=30))
-        self.session_positions = {}  # Posições 3D das sessões
-        self.camera_poses = [np.eye(4)]  # Histórico de poses da câmera
-        
-        # Métricas de performance
+        # Performance tracking
         self.fps_counter = 0
         self.fps_start_time = time.time()
         self.avg_fps = 0
         
-        # CONSTANTES DO DUTO
-        self.DUCT_SIZE = 0.50  # Duto quadrado de 50cm
-        self.DUCT_HALF_SIZE = self.DUCT_SIZE / 2  # 25cm do centro
-        self.DUCT_TOLERANCE = 0.02  # 2cm de tolerância
+        # NEW: Tracking components
+        self.track_history = defaultdict(lambda: deque(maxlen=30))
+        self.session_positions = {}  # 3D positions of sessions
+        self.drone_path = []  # Camera/drone trajectory
+        self.camera_poses = [np.eye(4)]  # Camera pose history
+
+        self.tube_width = 0.50  # 50cm in meters
+        self.tube_height = 0.50  # 50cm in meters
         
-        # Constantes de movimento do drone
-        self.MAX_DRONE_SPEED = 1.0  # m/s velocidade máxima
-        self.MAX_FRAME_MOVEMENT = 0.05  # 5cm movimento máximo por frame
+        # Camera calibration (will be updated based on actual frame size)
+        self.camera_matrix = None
+        self.frame_width = None
+        self.frame_height = None
         
-        # Configurações de sessões
-        self.MIN_SESSION_SPACING = 0.8  # Espaçamento mínimo entre sessões (80cm)
-        self.MAX_SESSION_SPACING = 1.5  # Espaçamento máximo entre sessões (150cm)
-        self.SESSION_WIDTH_RATIO = 0.85  # Sessões ocupam ~85% da largura do duto
-        self.MAX_SESSIONS_VISIBLE = 8  # Máximo de sessões visíveis simultaneamente
+        # Tracking improvements
+        self.min_track_length = 3  # Minimum frames to confirm a track
+        self.max_disappeared = 10  # Max frames a track can disappear
+        self.track_confidence_threshold = 0.3  # Lower for small objects
+
         
-        # Direção atual do duto
-        self.current_direction = np.array([0, 0, 1])  # Inicialmente para frente (Z)
-        self.direction_history = deque(maxlen=10)
         
-        print(f"🔧 Configurações do duto:")
-        print(f"   Tamanho: {self.DUCT_SIZE}x{self.DUCT_SIZE}m")
-        print(f"   Espaçamento de sessões: {self.MIN_SESSION_SPACING}-{self.MAX_SESSION_SPACING}m")
-        print(f"   Máximo de sessões visíveis: {self.MAX_SESSIONS_VISIBLE}")
-    
     def set_camera_calibration(self, frame_width, frame_height):
-        """Define calibração da câmera baseada no tamanho do frame"""
-        # Valores aproximados - idealmente calibrar com padrão de xadrez
-        fx = fy = frame_width * 0.8  # Aproximação focal length
+        """Set camera calibration based on actual frame dimensions"""
+        # Estimate focal length as ~0.8 * frame_width (common approximation)
+        fx = fy = 0.8 * frame_width
         cx = frame_width / 2
         cy = frame_height / 2
         
@@ -87,153 +65,67 @@ class DuctDetectorLocal:
             [0, 0, 1]
         ], dtype=np.float32)
         
-        print(f"📷 Calibração da câmera definida:")
-        print(f"   Resolução: {frame_width}x{frame_height}")
+        print(f"📐 Camera calibration set for {frame_width}x{frame_height}")
         print(f"   Focal length: {fx:.1f}")
-    
-    def estimate_depth_from_bbox(self, bbox_area, frame_width, frame_height):
+        print(f"   Principal point: ({cx:.1f}, {cy:.1f})")
+        
+    def process_frame(self, frame):
         """
-        Estima profundidade baseada no tamanho da bounding box
-        
-        Para sessões em duto de 50cm:
-        - Muito próximo (30cm): sessão ocupa ~70% da largura
-        - Próximo (60cm): sessão ocupa ~50% da largura
-        - Médio (100cm): sessão ocupa ~30% da largura
-        - Longe (150cm): sessão ocupa ~20% da largura
+        Process a single frame and return annotated result
         """
-        frame_area = frame_width * frame_height
-        bbox_ratio = bbox_area / frame_area
+        # Run inference
+        results = self.model(frame, conf=self.confidence_threshold, verbose=False)
         
-        # Largura esperada da sessão (85% do duto = 42.5cm)
-        session_width_m = self.DUCT_SIZE * self.SESSION_WIDTH_RATIO
+        # Get the annotated frame
+        annotated_frame = results[0].plot()
         
-        # Calcula profundidade baseada na proporção
-        if bbox_ratio > 0.3:  # Muito próximo
-            depth = 0.3
-        elif bbox_ratio > 0.2:  # Próximo
-            depth = 0.6
-        elif bbox_ratio > 0.1:  # Médio
-            depth = 1.0
-        elif bbox_ratio > 0.05:  # Longe
-            depth = 1.5
-        else:  # Muito longe
-            depth = 2.0
+        # Extract detection information
+        detections = []
+        if results[0].masks is not None:
+            for i, (box, mask, conf, cls) in enumerate(zip(
+                results[0].boxes.xyxy.cpu().numpy(),
+                results[0].masks.xy,
+                results[0].boxes.conf.cpu().numpy(),
+                results[0].boxes.cls.cpu().numpy()
+            )):
+                detection = {
+                    'bbox': box,
+                    'mask': mask,
+                    'confidence': conf,
+                    'class': int(cls),
+                    'class_name': self.model.names[int(cls)]
+                }
+                detections.append(detection)
         
-        # Limites físicos do duto
-        depth = max(depth, 0.2)  # Mínimo 20cm
-        depth = min(depth, 3.0)  # Máximo 3m (limite de visibilidade)
-        
-        return depth
-    
-    def pixel_to_world_constrained(self, center_2d, depth, camera_pose, frame_width, frame_height):
+        return annotated_frame, detections
+
+    def process_frame_with_tracking(self, frame, frame_idx):
         """
-        Converte coordenadas de pixel para mundo com restrições do duto
+        Enhanced tracking with validation
         """
-        if self.camera_matrix is None:
-            self.set_camera_calibration(frame_width, frame_height)
-        
-        # Parâmetros da câmera
-        fx, fy = self.camera_matrix[0,0], self.camera_matrix[1,1]
-        cx, cy = self.camera_matrix[0,2], self.camera_matrix[1,2]
-        
-        # Converte para coordenadas da câmera
-        x_cam = (center_2d[0] - cx) * depth / fx
-        y_cam = (center_2d[1] - cy) * depth / fy
-        z_cam = depth
-        
-        # RESTRIÇÃO CRÍTICA: Limita às dimensões do duto
-        x_cam = np.clip(x_cam, -self.DUCT_HALF_SIZE, self.DUCT_HALF_SIZE)
-        y_cam = np.clip(y_cam, -self.DUCT_HALF_SIZE, self.DUCT_HALF_SIZE)
-        
-        # Converte para coordenadas mundiais
-        cam_point = np.array([x_cam, y_cam, z_cam, 1])
-        world_point = camera_pose @ cam_point
-        
-        return world_point[:3]
-    
-    def estimate_camera_motion(self, frame, prev_frame):
-        """
-        Estima movimento da câmera entre frames
-        Movimento restrito pelas dimensões do duto
-        """
-        if prev_frame is None:
-            return np.eye(4)
-        
-        # Movimento típico do drone no duto: principalmente para frente
-        # Pequenos movimentos laterais e rotação permitidos
-        
-        # Movimento padrão para frente (ajustar baseado na velocidade do drone)
-        forward_motion = 0.03  # 3cm por frame (ajustar conforme FPS do vídeo)
-        
-        transform = np.eye(4)
-        transform[2, 3] = forward_motion  # Movimento no eixo Z (para frente)
-        
-        # Pequenas variações laterais devido ao voo do drone
-        # (Pode ser refinado com análise de fluxo óptico)
-        lateral_noise = np.random.normal(0, 0.005, 2)  # ±5mm de ruído
-        transform[0, 3] = lateral_noise[0]  # X
-        transform[1, 3] = lateral_noise[1]  # Y
-        
-        return transform
-    
-    def validate_session_positions(self, tracked_detections, camera_pose):
-        """
-        Valida se as posições das sessões fazem sentido no contexto do duto
-        """
-        valid_detections = []
-        camera_pos = camera_pose[:3, 3]
-        
-        for detection in tracked_detections:
-            track_id = detection['track_id']
-            
-            # Se já tem posição 3D, valida
-            if track_id in self.session_positions:
-                world_pos = self.session_positions[track_id]
-                relative_pos = world_pos - camera_pos
-                
-                # Distância lateral do centro do duto
-                lateral_distance = np.sqrt(relative_pos[0]**2 + relative_pos[1]**2)
-                
-                # Deve estar dentro do duto (com tolerância)
-                if lateral_distance <= (self.DUCT_HALF_SIZE + self.DUCT_TOLERANCE):
-                    # Profundidade razoável
-                    depth = relative_pos[2]
-                    if 0.1 <= depth <= 3.0:
-                        valid_detections.append(detection)
-                        continue
-            
-            # Se não tem posição 3D ainda, aceita por enquanto
-            valid_detections.append(detection)
-        
-        return valid_detections
-    
-    def process_frame(self, frame, frame_idx):
-        """
-        Processa um frame individual para detectar sessões
-        """
+        # Get frame dimensions
         frame_height, frame_width = frame.shape[:2]
         
+        # Set camera calibration if not done yet
         if self.camera_matrix is None:
             self.set_camera_calibration(frame_width, frame_height)
             self.frame_width = frame_width
             self.frame_height = frame_height
         
-        # Executa detecção/rastreamento YOLO
+        # Run inference with tracking
         results = self.model.track(
-            frame,
+            frame, 
             conf=self.confidence_threshold,
-            persist=True,
+            persist=True, 
             tracker="bytetrack.yaml",
-            iou=0.3,  # IoU threshold
-            max_det=self.MAX_SESSIONS_VISIBLE,
-            verbose=False
+            iou=0.3,
+            max_det=20,
+            agnostic_nms=True
         )
         
-        # Anota o frame
         annotated_frame = results[0].plot()
         tracked_detections = []
         
-        # Extrai informações das detecções
         if results[0].boxes is not None and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.cpu().numpy().astype(int)
@@ -244,7 +136,7 @@ class DuctDetectorLocal:
                 center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
                 bbox_area = (box[2] - box[0]) * (box[3] - box[1])
                 
-                # Atualiza histórico
+                # Store tracking history
                 self.track_history[track_id].append({
                     'frame': frame_idx,
                     'center': center,
@@ -264,339 +156,380 @@ class DuctDetectorLocal:
                     'class_name': self.model.names[int(cls)]
                 })
         
-        return annotated_frame, tracked_detections
+        # Validate and filter tracks
+        valid_tracks = self.validate_and_filter_tracks(tracked_detections, frame_idx)
+        
+        return annotated_frame, valid_tracks
+
+    def validate_and_filter_tracks(self, tracked_detections, frame_idx):
+        """
+        Filter out bad tracks and validate session positions
+        """
+        valid_tracks = []
+        
+        for detection in tracked_detections:
+            track_id = detection['track_id']
+            
+            # Check track history length
+            if len(self.track_history[track_id]) < self.min_track_length:
+                continue
+            
+            # Check if track is stable (not jumping around too much)
+            recent_positions = [item['center'] for item in list(self.track_history[track_id])[-5:]]
+            if len(recent_positions) >= 2:
+                # Calculate movement variance
+                positions = np.array(recent_positions)
+                movement_variance = np.var(positions, axis=0)
+                
+                # Skip tracks that move too erratically
+                if np.max(movement_variance) > 5000:  # Adjust threshold
+                    continue
+            
+            # Check confidence trend
+            recent_confidences = [item['confidence'] for item in list(self.track_history[track_id])[-3:]]
+            avg_confidence = np.mean(recent_confidences)
+            
+            if avg_confidence < self.track_confidence_threshold:
+                continue
+            
+            valid_tracks.append(detection)
+        
+        return valid_tracks
+    
+    def estimate_depth_from_size(self, bbox_area, frame_width, frame_height):
+        """
+        Improved depth estimation for 50x50cm tube
+        """
+        # Calculate what percentage of frame the bbox occupies
+        frame_area = frame_width * frame_height
+        bbox_ratio = bbox_area / frame_area
+        
+        print(f"Debug: bbox_area={bbox_area}, frame_area={frame_area}, ratio={bbox_ratio:.4f}")
+        
+        # For a 50cm tube, calibrate based on your actual footage
+        if bbox_ratio > 0.15:  # Very close
+            return 0.2  # 20cm from camera
+        elif bbox_ratio > 0.08:  # Medium distance
+            return 0.5  # 50cm from camera
+        elif bbox_ratio > 0.03:  # Far
+            return 1.0  # 1m from camera
+        else:  # Very far
+            return 2.0  # 2m from camera
+    
+    def pixel_to_world(self, center_2d, depth, camera_pose, frame_width, frame_height):
+        """
+        Improved 3D conversion for tube environment
+        """
+        # Use actual camera matrix
+        fx, fy = self.camera_matrix[0,0], self.camera_matrix[1,1]
+        cx, cy = self.camera_matrix[0,2], self.camera_matrix[1,2]
+        
+        # Convert to camera coordinates
+        x_cam = (center_2d[0] - cx) * depth / fx
+        y_cam = (center_2d[1] - cy) * depth / fy
+        z_cam = depth
+        
+        # Constrain to tube dimensions (50x50cm)
+        x_cam = np.clip(x_cam, -0.25, 0.25)  # ±25cm from center
+        y_cam = np.clip(y_cam, -0.25, 0.25)  # ±25cm from center
+        
+        # Convert to world coordinates
+        cam_point = np.array([x_cam, y_cam, z_cam, 1])
+        world_point = camera_pose @ cam_point
+        
+        return world_point[:3]
     
     def estimate_3d_positions(self, tracked_detections, camera_pose, frame_width, frame_height):
         """
-        Estima posições 3D das sessões detectadas
+        Improved 3D estimation for tube environment
         """
         for detection in tracked_detections:
             track_id = detection['track_id']
             center_2d = detection['center']
             bbox_area = detection['bbox_area']
             
-            # Estima profundidade
-            estimated_depth = self.estimate_depth_from_bbox(
-                bbox_area, frame_width, frame_height)
+            # Better depth estimation
+            estimated_depth = self.estimate_depth_from_size(bbox_area, frame_width, frame_height)
             
-            # Converte para coordenadas 3D
-            world_pos = self.pixel_to_world_constrained(
-                center_2d, estimated_depth, camera_pose, frame_width, frame_height)
+            # Convert to 3D
+            world_pos = self.pixel_to_world(center_2d, estimated_depth, camera_pose, 
+                                        frame_width, frame_height)
             
-            # Aplica suavização temporal
+            # More aggressive smoothing for small tube
             if track_id in self.session_positions:
                 prev_pos = self.session_positions[track_id]
-                
-                # Limita movimento entre frames
-                movement = np.linalg.norm(world_pos - prev_pos)
-                if movement > self.MAX_FRAME_MOVEMENT:
-                    # Limita movimento máximo
-                    direction = (world_pos - prev_pos) / movement
-                    world_pos = prev_pos + direction * self.MAX_FRAME_MOVEMENT
-                
-                # Suavização (filtro passa-baixa)
-                alpha = 0.1  # Fator de suavização
+                alpha = 0.1  # More smoothing
                 self.session_positions[track_id] = (
-                    alpha * world_pos + (1 - alpha) * prev_pos
+                    alpha * world_pos[0] + (1-alpha) * prev_pos[0],
+                    alpha * world_pos[1] + (1-alpha) * prev_pos[1],
+                    alpha * world_pos[2] + (1-alpha) * prev_pos[2]
                 )
             else:
                 self.session_positions[track_id] = world_pos
+
+    def estimate_camera_motion(self, frame, prev_frame):
+        """Estimate camera motion using feature matching"""
+        if prev_frame is None:
+            return np.eye(4)
+        
+        # Convert to grayscale
+        gray1 = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect and match features
+        detector = cv2.ORB_create(nfeatures=1000)
+        kp1, des1 = detector.detectAndCompute(gray1, None)
+        kp2, des2 = detector.detectAndCompute(gray2, None)
+        
+        if des1 is not None and des2 is not None and len(des1) > 10:
+            # Match features
+            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            matches = matcher.match(des1, des2)
+            matches = sorted(matches, key=lambda x: x.distance)
             
-            print(f"📍 Sessão {track_id}: profundidade={estimated_depth:.2f}m, "
-                  f"posição=({world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f})")
+            if len(matches) > 20:
+                # Extract matched points
+                pts1 = np.float32([kp1[m.queryIdx].pt for m in matches[:50]]).reshape(-1, 1, 2)
+                pts2 = np.float32([kp2[m.trainIdx].pt for m in matches[:50]]).reshape(-1, 1, 2)
+                
+                # Estimate homography
+                H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC)
+                
+                if H is not None:
+                    # Convert homography to simple translation
+                    translation = np.array([H[0, 2], H[1, 2], 0.1])
+                    
+                    # Create transformation matrix
+                    transform = np.eye(4)
+                    transform[:3, 3] = translation * 0.01
+                    return transform
+        
+        # Default: assume small forward motion
+        transform = np.eye(4)
+        transform[2, 3] = 0.01
+        return transform
     
-    def draw_duct_info(self, frame, tracked_detections):
-        """
-        Desenha informações do duto e sessões no frame
-        """
-        h, w = frame.shape[:2]
-        
-        # Desenha limites do duto (aproximado)
-        margin = 30  # pixels
-        cv2.rectangle(frame, (margin, margin), (w-margin, h-margin), (100, 100, 100), 2)
-        
-        # Linha central do duto
-        cv2.line(frame, (w//2, 0), (w//2, h), (100, 100, 100), 1)
-        cv2.line(frame, (0, h//2), (w, h//2), (100, 100, 100), 1)
-        
-        # Informações das sessões
+    def draw_tracking_info(self, frame, tracked_detections):
+        """Draw tracking information on frame"""
         for detection in tracked_detections:
             track_id = detection['track_id']
             center = detection['center']
-            confidence = detection['confidence']
             
-            # Label da sessão
-            if track_id in self.session_positions:
-                world_pos = self.session_positions[track_id]
-                depth = world_pos[2]
-                label = f"S{track_id}: {depth:.2f}m ({confidence:.2f})"
-            else:
-                label = f"S{track_id}: nova ({confidence:.2f})"
+            # Draw track ID
+            cv2.putText(frame, f"ID:{track_id}", 
+                       (int(center[0]), int(center[1]) - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
-            # Desenha label
-            cv2.putText(frame, label, 
-                       (int(center[0]), int(center[1]) - 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        
-        # Informações gerais
-        info_text = [
-            f"Duto: {self.DUCT_SIZE}x{self.DUCT_SIZE}m",
-            f"Sessões detectadas: {len(self.session_positions)}",
-            f"Confiança mínima: {self.confidence_threshold:.2f}",
-            f"FPS: {self.avg_fps:.1f}"
-        ]
-        
-        y_offset = 30
-        for text in info_text:
-            cv2.putText(frame, text, (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            y_offset += 25
-    
-    def update_fps(self):
-        """Atualiza cálculo de FPS"""
-        self.fps_counter += 1
-        if self.fps_counter % 10 == 0:  # Atualiza a cada 10 frames
-            current_time = time.time()
-            elapsed = current_time - self.fps_start_time
-            self.avg_fps = 10 / elapsed if elapsed > 0 else 0
-            self.fps_start_time = current_time
-    
-    def save_reconstruction(self, output_path):
-        """Salva dados de reconstrução 3D"""
-        reconstruction_data = {
-            'duct_size': self.DUCT_SIZE,
-            'session_positions': {
-                str(k): v.tolist() for k, v in self.session_positions.items()
-            },
-            'camera_poses': [pose.tolist() for pose in self.camera_poses],
-            'total_sessions': len(self.session_positions)
-        }
-        
-        with open(output_path, 'w') as f:
-            json.dump(reconstruction_data, f, indent=2)
-        
-        print(f"💾 Dados de reconstrução salvos em: {output_path}")
-    
-    def run_video_inference(self, video_path, output_path=None, reconstruction_path=None, display=True):
-        """
-        Executa inferência em um vídeo com detecção de sessões de dutos
-        """
+            # Draw tracking trail
+            if track_id in self.track_history and len(self.track_history[track_id]) > 1:
+                points = [item['center'] for item in list(self.track_history[track_id])[-10:]]
+                for i in range(1, len(points)):
+                    cv2.line(frame, 
+                           (int(points[i-1][0]), int(points[i-1][1])),
+                           (int(points[i][0]), int(points[i][1])),
+                           (0, 255, 255), 2)
+
+    def run_video_inference_with_tracking(self, video_path, output_path=None, 
+                                        reconstruction_path=None, display=True):
+        """Run inference with tracking and 3D reconstruction"""
         cap = cv2.VideoCapture(video_path)
         
         if not cap.isOpened():
-            print(f"❌ Erro: Não foi possível abrir o vídeo: {video_path}")
+            print(f"❌ Error: Could not open video file: {video_path}")
             return
         
-        # Propriedades do vídeo
+        # Get video properties
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        print(f"📹 Processando vídeo:")
-        print(f"   Arquivo: {video_path}")
-        print(f"   Resolução: {frame_width}x{frame_height}")
+        print(f"📹 Video Info (with tracking):")
+        print(f"   Resolution: {frame_width}x{frame_height}")
         print(f"   FPS: {fps}")
-        print(f"   Total de frames: {total_frames}")
+        print(f"   Total Frames: {total_frames}")
         
-        # Configuração de saída
+        # Setup video writer
         out = None
         if output_path:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+            print(f"💾 Output will be saved to: {output_path}")
         
+        # Processing loop
         frame_count = 0
         prev_frame = None
         
-        print("\n🚀 Iniciando processamento...")
+        print("\n🚀 Starting tracking inference...")
+        print("Press 'q' to quit, 'p' to pause/resume, 's' to save screenshot")
+        
+        paused = False
         
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            frame_count += 1
-            
-            # Estima movimento da câmera
-            if prev_frame is not None:
-                relative_pose = self.estimate_camera_motion(frame, prev_frame)
-                current_pose = self.camera_poses[-1] @ relative_pose
-                self.camera_poses.append(current_pose)
-            
-            # Processa frame
-            annotated_frame, tracked_detections = self.process_frame(frame, frame_count)
-            
-            # Valida detecções
-            valid_detections = self.validate_session_positions(
-                tracked_detections, self.camera_poses[-1])
-            
-            # Estima posições 3D
-            if valid_detections:
-                self.estimate_3d_positions(
-                    valid_detections, self.camera_poses[-1], frame_width, frame_height)
-            
-            # Desenha informações
-            self.draw_duct_info(annotated_frame, valid_detections)
-            
-            # Salva frame
-            if out:
-                out.write(annotated_frame)
-            
-            # Exibe frame
-            if display:
-                cv2.imshow('Detecção de Sessões de Dutos', annotated_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+            if not paused:
+                ret, frame = cap.read()
+                if not ret:
+                    print("\n✅ Video processing completed!")
                     break
+                
+                frame_count += 1
+                
+                # Estimate camera motion
+                if prev_frame is not None:
+                    relative_pose = self.estimate_camera_motion(frame, prev_frame)
+                    current_pose = self.camera_poses[-1] @ relative_pose
+                    self.camera_poses.append(current_pose)
+                    self.drone_path.append(current_pose[:3, 3])
+                
+                # Process frame with tracking
+                start_time = time.time()
+                annotated_frame, tracked_detections = self.process_frame_with_tracking(
+                    frame, frame_count)
+                processing_time = time.time() - start_time
+                
+                # Estimate 3D positions
+                if tracked_detections:
+                    self.estimate_3d_positions(tracked_detections, self.camera_poses[-1], 
+                                             frame_width, frame_height)
+                
+                # Draw tracking info
+                self.draw_tracking_info(annotated_frame, tracked_detections)
+                
+                # Calculate FPS
+                current_fps = self.calculate_fps()
+                
+                # Add info to frame
+                info_text = [
+                    f"Frame: {frame_count}/{total_frames} (TRACKING)",
+                    f"FPS: {current_fps:.1f}",
+                    f"Processing: {processing_time*1000:.1f}ms",
+                    f"Tracked Objects: {len(tracked_detections)}",
+                    f"Total Sessions: {len(self.session_positions)}"
+                ]
+                
+                y_offset = 30
+                for text in info_text:
+                    cv2.putText(annotated_frame, text, (10, y_offset), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    y_offset += 25
+                
+                # Save and display
+                if out:
+                    out.write(annotated_frame)
+                
+                if display:
+                    cv2.imshow('YOLO Duct Detection - Tracking', annotated_frame)
+                
+                prev_frame = frame.copy()
             
-            # Atualiza FPS
-            self.update_fps()
-            
-            # Progress
-            if frame_count % 100 == 0:
-                progress = (frame_count / total_frames) * 100
-                print(f"📊 Progresso: {progress:.1f}% ({frame_count}/{total_frames})")
-            
-            prev_frame = frame.copy()
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("\n🛑 Stopping inference...")
+                break
+            elif key == ord('p'):
+                paused = not paused
+                status = "PAUSED" if paused else "RESUMED"
+                print(f"⏸️ {status}")
+            elif key == ord('s'):
+                screenshot_path = f"tracking_screenshot_{frame_count}.jpg"
+                cv2.imwrite(screenshot_path, annotated_frame)
+                print(f"📸 Screenshot saved: {screenshot_path}")
         
-        # Limpeza
+        # Cleanup
         cap.release()
         if out:
             out.release()
         cv2.destroyAllWindows()
         
-        # Salva reconstrução
+        # Save reconstruction data
         if reconstruction_path:
             self.save_reconstruction(reconstruction_path)
         
-        # Relatório final
-        print(f"\n✅ Processamento concluído!")
-        print(f"📊 Estatísticas finais:")
-        print(f"   Frames processados: {frame_count}")
-        print(f"   Sessões detectadas: {len(self.session_positions)}")
-        print(f"   FPS médio: {self.avg_fps:.1f}")
+        print(f"\n📊 Tracking Results:")
+        print(f"   Unique Sessions Tracked: {len(self.session_positions)}")
+        print(f"   Drone Path Points: {len(self.drone_path)}")
+
+    def save_reconstruction(self, output_file):
+        """Save 3D reconstruction data"""
+        # Custom JSON encoder for numpy arrays
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, (np.integer, np.floating)):
+                    return obj.item()
+                elif isinstance(obj, deque):
+                    return list(obj)
+                return super().default(obj)
         
-        return self.session_positions
+        reconstruction_data = {
+            'session_positions': {str(k): v for k, v in self.session_positions.items()},
+            'drone_path': self.drone_path,
+            'track_history': {str(k): list(v) for k, v in self.track_history.items()},
+            'camera_poses': self.camera_poses
+        }
+        
+        with open(output_file, 'w') as f:
+            json.dump(reconstruction_data, f, indent=2, cls=NumpyEncoder)
+        
+        print(f"💾 3D reconstruction saved to: {output_file}")
+    
+    def calculate_fps(self):
+        """Calculate and return current FPS"""
+        self.fps_counter += 1
+        current_time = time.time()
+        
+        if current_time - self.fps_start_time >= 1.0:
+            self.avg_fps = self.fps_counter / (current_time - self.fps_start_time)
+            self.fps_counter = 0
+            self.fps_start_time = current_time
+        
+        return self.avg_fps
+    
+    # Keep your existing run_video_inference and run_webcam_inference methods...
+    def run_video_inference(self, video_path, output_path=None, display=True):
+        # ... your existing code ...
+        pass
     
     def run_webcam_inference(self, camera_id=0):
-        """
-        Executa inferência em tempo real com webcam
-        """
-        cap = cv2.VideoCapture(camera_id)
-        
-        if not cap.isOpened():
-            print(f"❌ Erro: Não foi possível abrir a câmera {camera_id}")
-            return
-        
-        print(f"📹 Inferência em tempo real - Pressione 'q' para sair")
-        
-        frame_count = 0
-        prev_frame = None
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            frame_count += 1
-            
-            # Estima movimento
-            if prev_frame is not None:
-                relative_pose = self.estimate_camera_motion(frame, prev_frame)
-                current_pose = self.camera_poses[-1] @ relative_pose
-                self.camera_poses.append(current_pose)
-            
-            # Processa
-            annotated_frame, tracked_detections = self.process_frame(frame, frame_count)
-            valid_detections = self.validate_session_positions(
-                tracked_detections, self.camera_poses[-1])
-            
-            if valid_detections:
-                frame_height, frame_width = frame.shape[:2]
-                self.estimate_3d_positions(
-                    valid_detections, self.camera_poses[-1], frame_width, frame_height)
-            
-            self.draw_duct_info(annotated_frame, valid_detections)
-            self.update_fps()
-            
-            cv2.imshow('Detecção de Sessões - Tempo Real', annotated_frame)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            
-            prev_frame = frame.copy()
-        
-        cap.release()
-        cv2.destroyAllWindows()
-
+        # ... your existing code ...
+        pass
 
 def main():
-    """Função principal"""
-    parser = argparse.ArgumentParser(
-        description='Sistema de Identificação de Sessões de Dutos',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Exemplos de uso:
-  # Processar vídeo básico
-  python duct_detector.py -m modelo.pt -v video.mp4
-  
-  # Processar com saída e reconstrução 3D
-  python duct_detector.py -m modelo.pt -v video.mp4 -o resultado.mp4 -r reconstrucao.json
-  
-  # Câmera em tempo real
-  python duct_detector.py -m modelo.pt -c 0
-  
-  # Ajustar confiança
-  python duct_detector.py -m modelo.pt -v video.mp4 --confidence 0.7
-        """)
-    
-    parser.add_argument('--model', '-m', required=True,
-                       help='Caminho para o modelo YOLO treinado (.pt)')
-    parser.add_argument('--video', '-v',
-                       help='Caminho para o arquivo de vídeo')
-    parser.add_argument('--camera', '-c', type=int,
-                       help='ID da câmera (default: 0)')
-    parser.add_argument('--output', '-o',
-                       help='Caminho para salvar vídeo de saída')
-    parser.add_argument('--confidence', '--conf', type=float, default=0.5,
-                       help='Limiar de confiança (default: 0.5)')
-    parser.add_argument('--no-display', action='store_true',
-                       help='Desabilita exibição em tempo real')
-    parser.add_argument('--reconstruction', '-r',
-                       help='Caminho para salvar dados de reconstrução 3D (JSON)')
+    parser = argparse.ArgumentParser(description='YOLO Duct Detection - Local Inference')
+    parser.add_argument('--model', '-m', required=True, help='Path to trained YOLO model (.pt file)')
+    parser.add_argument('--video', '-v', help='Path to input video file')
+    parser.add_argument('--camera', '-c', type=int, help='Camera device ID (default: 0)')
+    parser.add_argument('--output', '-o', help='Path to save output video')
+    parser.add_argument('--confidence', '-conf', type=float, default=0.5, help='Confidence threshold')
+    parser.add_argument('--no-display', action='store_true', help='Disable real-time display')
+    parser.add_argument('--tracking', '-t', action='store_true', help='Enable object tracking')
+    parser.add_argument('--reconstruction', '-r', help='Path to save 3D reconstruction data (JSON)')
     
     args = parser.parse_args()
     
-    # Validações
     if not os.path.exists(args.model):
-        print(f"❌ Erro: Arquivo do modelo não encontrado: {args.model}")
+        print(f"❌ Error: Model file not found: {args.model}")
         return
     
-    if not args.video and args.camera is None:
-        print("❌ Erro: Especifique --video ou --camera")
-        parser.print_help()
-        return
-    
-    if args.video and not os.path.exists(args.video):
-        print(f"❌ Erro: Arquivo de vídeo não encontrado: {args.video}")
-        return
-    
-    # Inicializa detector
-    print("🚀 Inicializando Sistema de Detecção de Sessões de Dutos")
+    # Initialize detector
     detector = DuctDetectorLocal(args.model, args.confidence)
     
-    # Executa inferência
-    try:
-        if args.video:
-            detector.run_video_inference(
+    # Run inference
+    if args.video:
+        if not os.path.exists(args.video):
+            print(f"❌ Error: Video file not found: {args.video}")
+            return
+        if args.tracking:
+            detector.run_video_inference_with_tracking(
                 args.video, args.output, args.reconstruction, not args.no_display)
         else:
-            detector.run_webcam_inference(args.camera)
-    except KeyboardInterrupt:
-        print("\n🛑 Interrompido pelo usuário")
-    except Exception as e:
-        print(f"❌ Erro durante execução: {e}")
-        raise
-
+            detector.run_video_inference(args.video, args.output, not args.no_display)
+    elif args.camera is not None:
+        detector.run_webcam_inference(args.camera)
+    else:
+        print("❌ Error: Please specify either --video or --camera")
 
 if __name__ == "__main__":
     main()
