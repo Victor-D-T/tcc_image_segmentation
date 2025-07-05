@@ -1,0 +1,6 @@
+path: yolo_dataset
+train: train/images
+val: val/images
+nc: 1
+names:
+- divider
