@@ -1,0 +1,26 @@
+# bytetrack.yaml — Configuração otimizada para YOLO + ByteTrack em objetos idênticos
+
+tracker_type: bytetrack
+
+# Confianças e thresholds
+track_high_thresh: 0.4       # valor mais baixo para manter IDs por mais tempo
+track_low_thresh: 0.1
+new_track_thresh: 0.5        # confiança mínima para iniciar nova track
+
+# Associação de objetos (para evitar troca de ID entre divisórias)
+match_thresh: 0.9
+fuse_score: true             # usa score+IoU como métrica de similaridade
+
+# Lógica temporal (muito importante para objetos idênticos)
+track_buffer: 60             # mantém IDs mesmo com oclusão ou pouca confiança
+max_age: 60                  # número de frames antes de considerar o objeto "perdido"
+min_hits: 1                  # já começa a considerar como track válida
+
+# IOU e Confidência
+iou_thres: 0.5
+conf_thres: 0.4
+low_conf_thres: 0.1
+high_conf_thres: 0.4
+
+# Extra
+mot20: false
