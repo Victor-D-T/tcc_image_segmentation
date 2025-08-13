@@ -1,188 +1,141 @@
 """
-Improved YOLO Duct Divider Tracker
-Enhanced motion analysis and distance-based tracking for unique dividers
+Simplified YOLO Duct Divider Tracker with Drone Position Data
+Uses CSV log file with drone position to accurately identify sections
 """
 
 import cv2
 import numpy as np
+import pandas as pd
 from ultralytics import YOLO
 import argparse
-from collections import deque
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 import time
-import math
 
 
 @dataclass
-class Divider:
-    """Represents a unique divider"""
+class Section:
+    """Represents a duct section"""
     id: int
-    estimated_distance: float
-    first_seen_frame: int
-    last_seen_frame: int
+    drone_position: float  # Position when detected
+    frame_number: int
     confidence: float
     bbox: np.ndarray
-    size_history: List[float]
-    
 
-class DuctTracker:
-    def __init__(self, model_path: str, confidence_threshold: float = 0.5):
-        """Initialize the tracker"""
+
+class SimplifiedDuctTracker:
+    def __init__(self, model_path: str, csv_path: str, section_length: float = 50.0, confidence_threshold: float = 0.5):
+        """
+        Initialize the tracker
+        
+        Args:
+            model_path: Path to YOLO model
+            csv_path: Path to CSV with drone position data
+            section_length: Length of each duct section in cm
+            confidence_threshold: Minimum confidence for detections
+        """
         self.model = YOLO(model_path)
         self.confidence_threshold = confidence_threshold
+        self.section_length = section_length
         
-        # Tracking parameters
-        self.reference_divider_size = 50  # cm - known real divider size
-        self.focal_length = 800  # pixels - camera focal length estimate
-        self.min_divider_separation = 10  # cm - minimum distance between unique dividers
-        self.size_change_threshold = 0.01  # 15% size change to indicate motion
+        # Load drone position data
+        self.drone_data = self.load_drone_data(csv_path)
         
-        # State tracking
-        self.unique_dividers: List[Divider] = []
-        self.next_divider_id = 1
+        # Tracking state
+        self.sections: List[Section] = []
         self.frame_count = 0
+        self.next_section_id = 1
         
-        # Motion analysis
-        self.prev_frame_gray = None
-        self.prev_detection_size = None
-        self.size_history = deque(maxlen=10)
-        self.distance_history = deque(maxlen=15)
+        # Video timing
+        self.video_start_time = 0  # Will be set when video starts
+        self.fps = 30  # Will be updated from video
         
-        # Detection stability
-        self.detection_buffer = deque(maxlen=5)
-        self.no_detection_frames = 0
+        # Position tracking
+        self.last_section_position = None
+        self.min_section_distance = section_length * 0.8  # 80% of section length as minimum
         
-        # Movement direction estimation
-        self.movement_direction = 0  # 1 = forward, -1 = backward, 0 = stationary
-        self.direction_history = deque(maxlen=8)
-        
-    def estimate_distance(self, bbox: np.ndarray) -> float:
-        """Estimate distance based on divider apparent size"""
-        x1, y1, x2, y2 = bbox
-        apparent_size = max(x2 - x1, y2 - y1)  # Use larger dimension
-        
-        # Distance = (Real_Size * Focal_Length) / Apparent_Size
-        distance = (self.reference_divider_size * self.focal_length) / max(apparent_size, 1)
-        return distance
-    
-    def calculate_detection_size(self, bbox: np.ndarray) -> float:
-        """Calculate the size of the detection box"""
-        x1, y1, x2, y2 = bbox
-        width = x2 - x1
-        height = y2 - y1
-        return max(width, height)  # Use the larger dimension
-    
-    def estimate_movement_direction(self, current_distance: float) -> int:
-        """Estimate movement direction based on distance changes"""
-        if len(self.distance_history) < 3:
-            return 0
-        
-        recent_distances = list(self.distance_history)[-5:]
-        if len(recent_distances) < 3:
-            return 0
-        
-        # Calculate trend
-        x = np.arange(len(recent_distances))
-        y = np.array(recent_distances)
-        
-        # Simple linear regression to detect trend
-        if len(x) > 1:
-            slope = np.polyfit(x, y, 1)[0]
+    def load_drone_data(self, csv_path: str) -> pd.DataFrame:
+        """Load and prepare drone position data from CSV"""
+        try:
+            df = pd.read_csv(csv_path)
+            print(f"📊 CSV columns: {df.columns.tolist()}")
             
-            # Threshold for significant movement
-            if abs(slope) > 0.5:  # 2cm per frame threshold
-                return -1 if slope > 0 else 1  # Negative distance change = moving forward
-        
-        return 0
+            df['position'] = -df['x']*100
+            df['position_y'] = df['y']
+            df['position_z'] = df['z']
+            
+            # Convert timestamp to seconds from start
+            if df['timestamp'].dtype == 'object':
+                # Try to parse timestamp strings
+                try:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df['timestamp'] = (df['timestamp'] - df['timestamp'].min()).dt.total_seconds()
+                except:
+                    print("⚠️  Could not parse timestamp. Using numeric values.")
+                    df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
+            
+            # Ensure timestamps are relative to start (0-based)
+            df['timestamp'] = df['timestamp'] - df['timestamp'].min()
+            
+            # Sort by timestamp
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            
+            print(f"📊 Loaded {len(df)} position records")
+            print(f"📊 Time range: {df['timestamp'].min():.2f}s to {df['timestamp'].max():.2f}s")
+            print(f"📊 Position range: {df['position'].min():.1f} to {df['position'].max():.1f}")
+            
+            return df[['timestamp', 'position']]
+            
+        except Exception as e:
+            print(f"❌ Error loading CSV: {e}")
+            # Create dummy data if CSV fails
+            return pd.DataFrame({'timestamp': [0], 'position': [0.0]})
     
-    def detect_new_divider_approach(self, current_distance: float, current_size: float) -> bool:
-        """Detect if we're approaching a new divider"""
+    def get_drone_position(self, current_time: float) -> float:
+        """Get drone position for a specific timestamp"""
+        if self.drone_data.empty:
+            return 0.0
         
-        # Need some history to compare
-        if len(self.distance_history) < 3:
-            return False
+        positions = self.drone_data['position']
+        position_row = round(self.frame_count/2,0)
+
+        position = positions[position_row]
+            # Linear interpolation between closest timestamps
+        print(f"🔍 position at {current_time:.2f}s: {position:.1f}cm")
+        return position
+    
+    def is_new_section(self, current_position: float, bbox: np.ndarray) -> bool:
+        """Determine if detection represents a new section based on drone position"""
         
-        recent_distances = list(self.distance_history)[-5:]
-        
-        # Check for rapid decrease in distance (approaching)
-        distance_change = recent_distances[-1] - recent_distances[0]
-        
-        # If distance is decreasing rapidly, we might be approaching
-        if distance_change < -1:  # 20cm decrease over 5 frames
+        # If no sections yet, this is the first one
+        if not self.sections:
             return True
         
-        # Check for size increase (getting closer)
-        if len(self.size_history) >=1:
-            size_change = (current_size - self.size_history[0]) / self.size_history[0]
-            if size_change > self.size_change_threshold:
+        # Check distance from last detected section
+        if self.last_section_position is not None:
+            distance_traveled = abs(current_position - self.last_section_position)
+            
+            # New section if drone moved at least minimum distance
+            if distance_traveled >= self.min_section_distance:
                 return True
         
-        return False
-    
-    def is_new_divider(self, distance: float, bbox: np.ndarray) -> bool:
-        """Enhanced logic to determine if detection represents a new unique divider"""
+        # Check against all existing sections
+        for section in self.sections:
+            position_diff = abs(current_position - section.drone_position)
+            if position_diff < self.min_section_distance:
+                return False  # Too close to existing section
         
-        current_size = self.calculate_detection_size(bbox)
-        
-        # Store current detection info
-        self.distance_history.append(distance)
-        self.size_history.append(current_size)
-        
-        # Update movement direction
-        self.movement_direction = self.estimate_movement_direction(distance)
-        self.direction_history.append(self.movement_direction)
-        
-        # If no existing dividers, this is the first one
-        if not self.unique_dividers:
-            return True
-        
-        # Check distance separation from existing dividers
-        for divider in self.unique_dividers:
-            distance_diff = abs(distance - divider.estimated_distance)
-            
-            # If very close to existing divider, update it
-            if distance_diff < self.min_divider_separation:
-                divider.last_seen_frame = self.frame_count
-                divider.size_history.append(current_size)
-                return False
-        
-        # Check for approach pattern
-        if self.detect_new_divider_approach(distance, current_size):
-            # Additional validation: check if we've passed through a gap
-            if len(self.distance_history) >= 10:
-                # Look for a pattern where distance increased then decreased
-                mid_point = len(self.distance_history) // 2
-                early_distances = list(self.distance_history)[:mid_point]
-                recent_distances = list(self.distance_history)[mid_point:]
-                
-                if early_distances and recent_distances:
-                    early_avg = np.mean(early_distances)
-                    recent_avg = np.mean(recent_distances)
-                    
-                    # If we had larger distances before and now smaller, we passed through
-                    if early_avg > recent_avg + 30:  # 30cm threshold
-                        return True
-        
-        # Check for consistent movement in one direction
-        if len(self.direction_history) >= 5:
-            recent_directions = list(self.direction_history)[-5:]
-            if abs(sum(recent_directions)) >= 3:  # Consistent movement
-                
-                # Check if current distance is significantly different from last divider
-                if self.unique_dividers:
-                    last_divider = self.unique_dividers[-1]
-                    frames_since_last = self.frame_count - last_divider.last_seen_frame
-                    
-                    # If enough time has passed and distance is different
-                    if frames_since_last > 20 and abs(distance - last_divider.estimated_distance) > self.min_divider_separation:
-                        return True
-        
-        return False
+        return True
     
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[dict]]:
         """Process a single frame"""
         self.frame_count += 1
+        
+        # Calculate current video time in seconds
+        current_time = (self.frame_count - 1) / self.fps
+        
+        # Get drone position for this timestamp
+        drone_position = self.get_drone_position(current_time)
         
         # Run YOLO detection
         results = self.model.predict(frame, conf=self.confidence_threshold)
@@ -191,8 +144,6 @@ class DuctTracker:
         current_detections = []
         
         if results[0].boxes is not None and len(results[0].boxes) > 0:
-            self.no_detection_frames = 0
-            
             boxes = results[0].boxes.xyxy.cpu().numpy()
             confidences = results[0].boxes.conf.cpu().numpy()
             
@@ -201,60 +152,51 @@ class DuctTracker:
             bbox = boxes[best_idx]
             conf = confidences[best_idx]
             
-            # Estimate distance
-            distance = self.estimate_distance(bbox)
-            
             detection_info = {
                 'bbox': bbox,
                 'confidence': conf,
-                'distance': distance,
-                'size': self.calculate_detection_size(bbox)
+                'drone_position': drone_position,
+                'frame': self.frame_count,
+                'time': current_time
             }
             current_detections.append(detection_info)
             
-            # Check if this is a new unique divider
-            if self.is_new_divider(distance, bbox):
-                new_divider = Divider(
-                    id=self.next_divider_id,
-                    estimated_distance=distance,
-                    first_seen_frame=self.frame_count,
-                    last_seen_frame=self.frame_count,
+            # Check if this represents a new section
+            if self.is_new_section(drone_position, bbox):
+                new_section = Section(
+                    id=self.next_section_id,
+                    drone_position=drone_position,
+                    frame_number=self.frame_count,
                     confidence=conf,
-                    bbox=bbox,
-                    size_history=[self.calculate_detection_size(bbox)]
+                    bbox=bbox
                 )
                 
-                self.unique_dividers.append(new_divider)
-                self.next_divider_id += 1
+                self.sections.append(new_section)
+                self.last_section_position = drone_position
+                self.next_section_id += 1
                 
-                print(f"✅ New divider #{new_divider.id} detected at {distance:.1f}cm (frame {self.frame_count})")
-        
-        else:
-            self.no_detection_frames += 1
+                print(f"✅ New section #{new_section.id} detected at position {drone_position:.1f}cm (frame {self.frame_count}, time {current_time:.2f}s)")
         
         # Add visualization
-        self.add_info_overlay(annotated_frame, current_detections)
+        self.add_info_overlay(annotated_frame, current_detections, drone_position, current_time)
         
         return annotated_frame, current_detections
     
-    def add_info_overlay(self, frame: np.ndarray, detections: List[dict]):
+    def add_info_overlay(self, frame: np.ndarray, detections: List[dict], drone_position: float, current_time: float):
         """Add information overlay to the frame"""
-        
-        # Create info panel
-        movement_dir_str = {1: "Forward", -1: "Backward", 0: "Stationary"}[self.movement_direction]
         
         info_lines = [
             f"Frame: {self.frame_count}",
-            f"Movement: {movement_dir_str}",
+            f"Time: {current_time:.2f}s",
+            f"Drone Position: {drone_position:.1f}cm",
             f"Current Detections: {len(detections)}",
-            f"Unique Dividers: {len(self.unique_dividers)}",
-            f"No Detection: {self.no_detection_frames} frames",
-            f"Confidence: {self.confidence_threshold:.2f}"
+            f"Sections Found: {len(self.sections)}",
+            f"Section Length: {self.section_length:.1f}cm"
         ]
         
-        # Add semi-transparent background
+        # Semi-transparent background
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (400, 170), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (10, 10), (350, 170), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
         # Add text
@@ -262,30 +204,21 @@ class DuctTracker:
             cv2.putText(frame, line, (20, 35 + i * 25), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # Show current detections with distances
+        # Show detection info
         for detection in detections:
             bbox = detection['bbox'].astype(int)
-            distance = detection['distance']
             conf = detection['confidence']
             
-            # Draw distance info near detection
-            cv2.putText(frame, f"{distance:.0f}cm ({conf:.2f})", 
+            cv2.putText(frame, f"Conf: {conf:.2f}", 
                        (bbox[0], bbox[1] - 10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
-        # Show unique dividers summary
-        if self.unique_dividers:
-            distances = sorted([d.estimated_distance for d in self.unique_dividers])
-            summary = f"Dividers: {', '.join([f'{d:.0f}cm' for d in distances])}"
+        # Show sections summary
+        if self.sections:
+            positions = sorted([s.drone_position for s in self.sections])
+            summary = f"Sections at: {', '.join([f'{p:.0f}cm' for p in positions])}"
             cv2.putText(frame, summary, (20, frame.shape[0] - 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
-        # Show distance history as a simple graph
-        if len(self.distance_history) > 1:
-            history_display = f"Distance trend: {list(self.distance_history)[-5:]}"
-            cv2.putText(frame, f"Recent distances: {[f'{d:.0f}' for d in list(self.distance_history)[-5:]]}", 
-                       (20, frame.shape[0] - 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
     
     def run_video_tracking(self, video_path: str, output_path: str = None, display: bool = True):
         """Run tracking on video file"""
@@ -296,50 +229,47 @@ class DuctTracker:
             return
         
         # Get video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        self.fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = total_frames / self.fps
         
-        print(f"📹 Video: {width}x{height} @ {fps}fps, {total_frames} frames")
+        print(f"📹 Video: {width}x{height} @ {self.fps}fps, {total_frames} frames ({video_duration:.1f}s)")
+        
+        # Check if we have enough log data
+        if not self.drone_data.empty:
+            log_duration = self.drone_data['timestamp'].max()
+            print(f"📊 Log duration: {log_duration:.1f}s")
+            if log_duration < video_duration * 0.8:
+                print("⚠️  Warning: Log duration is much shorter than video duration")
         
         # Setup output video
         out = None
         if output_path:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            out = cv2.VideoWriter(output_path, fourcc, self.fps, (width, height))
         
-        print("🚀 Starting tracking... Press 'q' to quit, 'p' to pause")
+        print("🚀 Starting tracking... Press 'q' to quit")
         
-        paused = False
         while True:
-            if not paused:
-                ret, frame = cap.read()
-                if not ret:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Process frame
+            annotated_frame, detections = self.process_frame(frame)
+            
+            # Save output
+            if out:
+                out.write(annotated_frame)
+            
+            # Display
+            if display:
+                cv2.imshow('Simplified Duct Tracker', annotated_frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
-                
-                # Process frame
-                annotated_frame, detections = self.process_frame(frame)
-                
-                # Save output
-                if out:
-                    out.write(annotated_frame)
-                
-                # Display
-                if display:
-                    cv2.imshow('Improved Duct Divider Tracker', annotated_frame)
-                    
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('p'):
-                        paused = not paused
-            else:
-                key = cv2.waitKey(30) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('p'):
-                    paused = False
         
         # Cleanup
         cap.release()
@@ -354,44 +284,50 @@ class DuctTracker:
         """Print final tracking results"""
         print(f"\n📊 Tracking Results:")
         print(f"   Total frames processed: {self.frame_count}")
-        print(f"   Unique dividers found: {len(self.unique_dividers)}")
+        print(f"   Sections detected: {len(self.sections)}")
         
-        if self.unique_dividers:
-            print(f"\n📏 Divider Positions:")
-            sorted_dividers = sorted(self.unique_dividers, key=lambda d: d.estimated_distance)
+        if self.sections:
+            print(f"\n📏 Section Positions:")
+            sorted_sections = sorted(self.sections, key=lambda s: s.drone_position)
             
-            for divider in sorted_dividers:
-                frame_duration = divider.last_seen_frame - divider.first_seen_frame + 1
-                print(f"   Divider #{divider.id}: {divider.estimated_distance:.1f}cm "
-                      f"(frames {divider.first_seen_frame}-{divider.last_seen_frame}, "
-                      f"duration: {frame_duration} frames)")
+            for section in sorted_sections:
+                print(f"   Section #{section.id}: {section.drone_position:.1f}cm "
+                      f"(frame {section.frame_number})")
             
             # Calculate spacing
-            if len(sorted_dividers) > 1:
+            if len(sorted_sections) > 1:
                 spacings = []
-                for i in range(len(sorted_dividers) - 1):
-                    spacing = abs(sorted_dividers[i+1].estimated_distance - sorted_dividers[i].estimated_distance)
+                for i in range(len(sorted_sections) - 1):
+                    spacing = abs(sorted_sections[i+1].drone_position - sorted_sections[i].drone_position)
                     spacings.append(spacing)
                 
                 avg_spacing = np.mean(spacings)
                 print(f"\n   Average spacing: {avg_spacing:.1f}cm")
-                print(f"   Spacing range: {min(spacings):.1f}cm - {max(spacings):.1f}cm")
+                print(f"   Expected spacing: {self.section_length:.1f}cm")
+                print(f"   Spacing accuracy: {(1 - abs(avg_spacing - self.section_length) / self.section_length) * 100:.1f}%")
         else:
-            print("   ⚠️  No unique dividers detected. Consider adjusting parameters.")
+            print("   ⚠️  No sections detected. Check CSV data and detection parameters.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Improved Duct Divider Tracker')
+    parser = argparse.ArgumentParser(description='Simplified Duct Tracker with Drone Position')
     parser.add_argument('--model', '-m', required=True, help='Path to YOLO model')
     parser.add_argument('--video', '-v', required=True, help='Path to video file')
+    parser.add_argument('--csv', '-c', required=True, help='Path to CSV with drone position data')
     parser.add_argument('--output', '-o', help='Output video path')
-    parser.add_argument('--confidence', '-c', type=float, default=0.5, help='Confidence threshold')
+    parser.add_argument('--section-length', '-s', type=float, default=50.0, help='Section length in cm')
+    parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold')
     parser.add_argument('--no-display', action='store_true', help='Disable display')
     
     args = parser.parse_args()
     
     # Initialize tracker
-    tracker = DuctTracker(args.model, args.confidence)
+    tracker = SimplifiedDuctTracker(
+        model_path=args.model,
+        csv_path=args.csv,
+        section_length=args.section_length,
+        confidence_threshold=args.confidence
+    )
     
     # Run tracking
     tracker.run_video_tracking(args.video, args.output, not args.no_display)
