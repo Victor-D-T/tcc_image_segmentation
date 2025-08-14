@@ -1,0 +1,7 @@
+names:
+  0: not revited
+  1: riveted
+nc: 2
+path: C:\Users\Victor Dias Teixeira\Documents\USP\TCC\tcc_image_segmentation\rivetes\yolo_dataset
+train: train/images
+val: val/images
